@@ -2,7 +2,7 @@
 
 client_id = "0048ed76f8092ef9c308dd95a76798ff"
 name = "PO Cost Manager"
-application_url = "https://po-cost-manager.fly.dev"
+application_url = "https://pocostmanager.onrender.com"
 embedded = true
 
 [build]
