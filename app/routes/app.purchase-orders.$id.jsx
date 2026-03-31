@@ -129,7 +129,7 @@ export async function action({ request, params }) {
             featuredImage {
               url
             }
-            variants(first: 10) {
+            variants(first: 80) {
               nodes {
                 id
                 title
