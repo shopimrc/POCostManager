@@ -11,29 +11,57 @@ import { useEffect, useMemo, useState } from "react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 
-function buildDefaultDestination(storeLocation) {
+async function getShopifyLocations(request) {
+  const { admin } = await authenticate.admin(request);
+
+  const response = await admin.graphql(
+    `
+    query GetLocations {
+      locations(first: 25) {
+        nodes {
+          id
+          name
+          address {
+            address1
+            address2
+            city
+            provinceCode
+            zip
+          }
+        }
+      }
+    }
+    `,
+  );
+
+  const json = await response.json();
+  const nodes = json?.data?.locations?.nodes || [];
+
+  return nodes.map((location) => ({
+    id: location.id,
+    name: location.name || "Store",
+    address1: location.address?.address1 || "",
+    address2: location.address?.address2 || "",
+    city: location.address?.city || "",
+    provinceCode: location.address?.provinceCode || "",
+    zip: location.address?.zip || "",
+  }));
+}
+
+function buildDestination(location) {
   return {
     storeName: "IMRC Racing N Repair",
-    destinationName: storeLocation?.name || "717 West 5th Avenue",
+    destinationName: location?.name || "717 West 5th Avenue",
     destinationAddr:
       [
-        storeLocation?.address1,
-        storeLocation?.address2,
-        [storeLocation?.city, storeLocation?.provinceCode || storeLocation?.province, storeLocation?.zip]
-          .filter(Boolean)
-          .join(", "),
+        location?.address1,
+        location?.address2,
+        [location?.city, location?.provinceCode, location?.zip].filter(Boolean).join(", "),
       ]
         .filter(Boolean)
         .join(", ") || "717 West 5th Avenue, Warren, PA",
-    locationGid: storeLocation?.id || "",
+    locationGid: location?.id || "",
   };
-}
-
-
-function formatNextPoNumber(lastPoNumber) {
-  const digits = String(lastPoNumber || "").replace(/\D/g, "");
-  const nextNumber = Number(digits || "0") + 1;
-  return String(nextNumber).padStart(6, "0");
 }
 
 async function fetchLiveVariantSnapshots(admin, lines) {
@@ -99,8 +127,6 @@ async function fetchLiveVariantSnapshots(admin, lines) {
         currentCost: Number(node.inventoryItem?.unitCost?.amount || 0),
         inventoryItemGid: node.inventoryItem?.id || "",
         imageUrl: node.image?.url || node.product?.featuredImage?.url || "",
-        variantTitle: node.title || "",
-        productTitle: node.product?.title || "",
       });
     }
   }
@@ -124,15 +150,32 @@ function mergeLiveLineData(lines, snapshots) {
   });
 }
 
-
-export async function loader() {
+export async function loader({ request }) {
   const suppliers = await prisma.supplier.findMany({
     orderBy: { company: "asc" },
   });
 
+  const locations = await getShopifyLocations(request);
+  const defaultDestination = buildDestination(locations[0] || null);
+
+  const existingPoNumbers = await prisma.purchaseOrder.findMany({
+    select: { poNumber: true },
+  });
+
+  let highestPoNumber = 0;
+  for (const row of existingPoNumbers) {
+    const match = String(row?.poNumber || "").match(/(\d+)/);
+    const value = match ? Number(match[1]) : 0;
+    if (value > highestPoNumber) highestPoNumber = value;
+  }
+
+  const nextPoNumber = `PO${highestPoNumber + 1}`;
+
   return {
     suppliers,
-    defaultDestination: buildDefaultDestination(null),
+    locations,
+    defaultDestination,
+    nextPoNumber,
   };
 }
 
@@ -140,7 +183,6 @@ export async function action({ request }) {
   const formData = await request.formData();
   const url = new URL(request.url);
   const intent = String(formData.get("intent") || "");
-  const defaultDestination = buildDefaultDestination(null);
 
   if (intent === "create-supplier") {
     const company = String(formData.get("company") || "").trim();
@@ -182,7 +224,6 @@ export async function action({ request }) {
 
   if (intent === "search-products") {
     const q = String(formData.get("q") || "").trim();
-
     const { admin } = await authenticate.admin(request);
 
     const response = await admin.graphql(
@@ -243,8 +284,8 @@ export async function action({ request }) {
     return { searchResults };
   }
 
-  const poNumber = String(formData.get("poNumber") || "").trim();
   const supplierId = String(formData.get("supplierId") || "").trim();
+  const poNumber = String(formData.get("poNumber") || "").trim();
   const destinationName = String(formData.get("destinationName") || "").trim();
   const destinationAddr = String(formData.get("destinationAddr") || "").trim();
   const locationGid = String(formData.get("locationGid") || "").trim();
@@ -268,12 +309,6 @@ export async function action({ request }) {
     lines = [];
   }
 
-  if (lines.length) {
-    const { admin } = await authenticate.admin(request);
-    const liveSnapshots = await fetchLiveVariantSnapshots(admin, lines);
-    lines = mergeLiveLineData(lines, liveSnapshots);
-  }
-
   if (!poNumber || !supplierId) {
     return { error: "PO Number and Supplier are required." };
   }
@@ -294,6 +329,16 @@ export async function action({ request }) {
     return { error: "Selected supplier was not found." };
   }
 
+  if (!locationGid) {
+    return { error: "Please select a store destination before saving this PO." };
+  }
+
+  if (lines.length) {
+    const { admin } = await authenticate.admin(request);
+    const liveSnapshots = await fetchLiveVariantSnapshots(admin, lines);
+    lines = mergeLiveLineData(lines, liveSnapshots);
+  }
+
   const vendorAddress = [
     supplier.address1,
     supplier.address2,
@@ -309,9 +354,9 @@ export async function action({ request }) {
       vendorName: supplier.company,
       vendorAddress: vendorAddress || null,
 
-      locationGid: locationGid || defaultDestination.locationGid,
-      destinationName: destinationName || defaultDestination.destinationName,
-      destinationAddr: destinationAddr || defaultDestination.destinationAddr,
+      locationGid,
+      destinationName: destinationName || null,
+      destinationAddr: destinationAddr || null,
 
       estimatedArrival: estimatedArrival || null,
       shippingCarrier: shippingCarrier || null,
@@ -325,7 +370,7 @@ export async function action({ request }) {
       noteToSupplier: noteToSupplier || null,
       tags: tags || null,
 
-      referenceNumber: defaultDestination.storeName,
+      referenceNumber: "IMRC Racing N Repair",
       status: "DRAFT",
 
       lines: {
@@ -339,7 +384,7 @@ export async function action({ request }) {
           currentInventory: Number(line.currentInventory || 0),
           currentCost: Number(line.currentCost || 0),
           qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
-          qtyReceiving: Number(line.qtyReceiving || 1),
+          qtyReceiving: Number(line.qtyOrdered || line.qtyReceiving || 1),
           itemCost: Number(line.itemCost || 0),
         })),
       },
@@ -350,7 +395,7 @@ export async function action({ request }) {
 }
 
 export default function NewPurchaseOrderPage() {
-  const { suppliers, defaultDestination, nextPoNumber } = useLoaderData();
+  const { suppliers, locations, defaultDestination, nextPoNumber } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const productFetcher = useFetcher();
@@ -361,13 +406,15 @@ export default function NewPurchaseOrderPage() {
   const [otherFeesTotal, setOtherFeesTotal] = useState(0);
   const [taxTotal, setTaxTotal] = useState(0);
   const [productSearch, setProductSearch] = useState("");
+  const [selectedLocationGid, setSelectedLocationGid] = useState(defaultDestination.locationGid);
+  const [destinationName, setDestinationName] = useState(defaultDestination.destinationName);
+  const [destinationAddr, setDestinationAddr] = useState(defaultDestination.destinationAddr);
 
   const selectedSupplierId = searchParams.get("supplierId") || "";
   const showSupplierModal = searchParams.get("createSupplier") === "1";
   const showProductModal = searchParams.get("addProducts") === "1";
 
-  const selectedSupplier =
-    suppliers.find((s) => s.id === selectedSupplierId) || null;
+  const selectedSupplier = suppliers.find((s) => s.id === selectedSupplierId) || null;
 
   const [selectedProducts, setSelectedProducts] = useState([]);
   const [checkedMap, setCheckedMap] = useState({});
@@ -388,6 +435,14 @@ export default function NewPurchaseOrderPage() {
 
     productFetcher.submit(formData, { method: "post" });
   }, [showProductModal, productSearch]);
+
+  function handleLocationChange(value) {
+    setSelectedLocationGid(value);
+    const selectedLocation = locations.find((loc) => loc.id === value);
+    const destination = buildDestination(selectedLocation || null);
+    setDestinationName(destination.destinationName);
+    setDestinationAddr(destination.destinationAddr);
+  }
 
   function openSupplierModal() {
     const next = new URLSearchParams(searchParams);
@@ -479,19 +534,11 @@ export default function NewPurchaseOrderPage() {
             ? Number(value || 0)
             : value;
 
-        if (field === "qtyReceiving") {
+        if (field === "qtyReceiving" || field === "qtyOrdered") {
           return {
             ...item,
             qtyReceiving: Number(value || 0),
             qtyOrdered: Number(value || 0),
-          };
-        }
-
-        if (field === "qtyOrdered") {
-          return {
-            ...item,
-            qtyOrdered: Number(value || 0),
-            qtyReceiving: Number(value || 0),
           };
         }
 
@@ -521,9 +568,9 @@ export default function NewPurchaseOrderPage() {
 
       <Form method="post">
         <input type="hidden" name="supplierId" value={selectedSupplierId} />
-        <input type="hidden" name="destinationName" value={defaultDestination.destinationName} />
-        <input type="hidden" name="destinationAddr" value={defaultDestination.destinationAddr} />
-        <input type="hidden" name="locationGid" value={defaultDestination.locationGid} />
+        <input type="hidden" name="destinationName" value={destinationName} />
+        <input type="hidden" name="destinationAddr" value={destinationAddr} />
+        <input type="hidden" name="locationGid" value={selectedLocationGid} />
         <input type="hidden" name="linesJson" value={JSON.stringify(selectedProducts)} />
 
         <div style={topWrapStyle}>
@@ -554,16 +601,24 @@ export default function NewPurchaseOrderPage() {
             </div>
 
             <div style={subTextStyle}>
-              {selectedSupplier
-                ? formatSupplierAddress(selectedSupplier)
-                : "No supplier selected"}
+              {selectedSupplier ? formatSupplierAddress(selectedSupplier) : "No supplier selected"}
             </div>
           </section>
 
           <section style={topPanelStyleRight}>
-            <div style={panelLabelStyle}>Destination</div>
-            <div style={destinationTitleStyle}>{defaultDestination.destinationName}</div>
-            <div style={subTextStyle}>{defaultDestination.destinationAddr}</div>
+            <div style={panelLabelStyle}>Destination Store</div>
+            <select
+              value={selectedLocationGid}
+              onChange={(e) => handleLocationChange(e.target.value)}
+              style={topSelectStyle}
+            >
+              {locations.map((location) => (
+                <option key={location.id} value={location.id}>
+                  {location.name}
+                </option>
+              ))}
+            </select>
+            <div style={{ ...subTextStyle, marginTop: 8 }}>{destinationAddr}</div>
           </section>
         </div>
 
@@ -608,19 +663,19 @@ export default function NewPurchaseOrderPage() {
             </button>
           </div>
 
-          <div style={{ marginTop: 18, overflowX: "auto" }}>
+          <div style={{ marginTop: 10, overflowX: "auto" }}>
             <table style={tableStyle}>
               <thead>
                 <tr>
                   <Th>Products</Th>
-                  <Th>Supplier SKU</Th>
-                  <Th num>Quantity</Th>
-                  <Th num>Item Cost</Th>
-                  <Th num>Current Inventory</Th>
-                  <Th num>Current Cost</Th>
-                  <Th num>New Landed Cost</Th>
-                  <Th num>New Average Cost</Th>
+                  <Th>Supp SKU</Th>
+                  <Th num>Qty</Th>
+                  <Th num>PO Cost</Th>
                   <Th num>Total</Th>
+                  <Th sep num>Inv. On Hand</Th>
+                  <Th num>On-Ground Cost</Th>
+                  <Th num>Landed Cost</Th>
+                  <Th num>Avg. Cost</Th>
                   <Th></Th>
                 </tr>
               </thead>
@@ -676,18 +731,14 @@ export default function NewPurchaseOrderPage() {
                         />
                       </Td>
 
-                      <Td num>{line.currentInventory}</Td>
+                      <Td num>{money(line.total)}</Td>
+                      <Td sep num>{line.currentInventory}</Td>
                       <Td num>{money(line.currentCost)}</Td>
                       <Td num>{money(line.newLandedCost)}</Td>
                       <Td num><strong>{money(line.newAverageCost)}</strong></Td>
-                      <Td num>{money(line.total)}</Td>
 
                       <Td>
-                        <button
-                          type="button"
-                          onClick={() => removeLine(index)}
-                          style={deleteButtonStyle}
-                        >
+                        <button type="button" onClick={() => removeLine(index)} style={deleteButtonStyle}>
                           ×
                         </button>
                       </Td>
@@ -705,7 +756,7 @@ export default function NewPurchaseOrderPage() {
 
             <div style={{ marginBottom: 10 }}>
               <label style={smallLabelStyle}>PO Number</label>
-              <input name="poNumber" defaultValue={nextPoNumber} style={compactInputStyle} placeholder="000001" />
+              <input name="poNumber" defaultValue={nextPoNumber} style={compactInputStyle} />
             </div>
 
             <div style={{ marginBottom: 10 }}>
@@ -773,11 +824,7 @@ export default function NewPurchaseOrderPage() {
         </div>
 
         <div style={footerRowStyle}>
-          <button
-            type="submit"
-            style={saveButtonStyle}
-            disabled={navigation.state === "submitting"}
-          >
+          <button type="submit" style={saveButtonStyle} disabled={navigation.state === "submitting"}>
             {navigation.state === "submitting" ? "Saving..." : "Save PO"}
           </button>
         </div>
@@ -881,7 +928,7 @@ export default function NewPurchaseOrderPage() {
                           </div>
                         </div>
 
-                        <div style={{ width: 90, textAlign: "right" }}>
+                        <div style={{ width: 62, textAlign: "right" }}>
                           <div style={smallLabelStyle}>Available</div>
                           <div style={infoValueStyle}>{item.currentInventory}</div>
                         </div>
@@ -962,14 +1009,15 @@ function computeDraftLines(poLike) {
   });
 }
 
-function Th({ children, num = false }) {
+function Th({ children, num = false, sep = false }) {
   return (
     <th
       style={{
         textAlign: num ? "right" : "left",
-        padding: "12px 10px",
+        borderLeft: sep ? "2px solid #e5e7eb" : "none",
+        padding: "9px 6px",
         borderBottom: "1px solid #e5e7eb",
-        fontSize: 13,
+        fontSize: 12,
         color: "#374151",
         whiteSpace: "nowrap",
       }}
@@ -979,15 +1027,16 @@ function Th({ children, num = false }) {
   );
 }
 
-function Td({ children, num = false }) {
+function Td({ children, num = false, sep = false }) {
   return (
     <td
       style={{
         textAlign: num ? "right" : "left",
-        padding: "14px 10px",
+        borderLeft: sep ? "2px solid #f0f0f0" : "none",
+        padding: "8px 6px",
         borderBottom: "1px solid #f0f0f0",
         verticalAlign: "middle",
-        whiteSpace: "nowrap",
+        whiteSpace: "normal",
       }}
     >
       {children}
@@ -1001,7 +1050,7 @@ function money(value) {
 
 const pageStyle = {
   padding: 12,
-  maxWidth: 1180,
+  maxWidth: 1120,
   margin: "0 auto",
 };
 
@@ -1015,16 +1064,16 @@ const topWrapStyle = {
 };
 
 const topPanelStyleLeft = {
-  padding: "16px 18px 12px 18px",
+  padding: "12px 14px 10px 14px",
   borderRight: "1px solid #e5e7eb",
 };
 
 const topPanelStyleRight = {
-  padding: "16px 18px 12px 18px",
+  padding: "12px 14px 10px 14px",
 };
 
 const panelLabelStyle = {
-  fontSize: 13,
+  fontSize: 12,
   fontWeight: 700,
   marginBottom: 8,
   color: "#374151",
@@ -1059,18 +1108,18 @@ const destinationTitleStyle = {
 };
 
 const subTextStyle = {
-  fontSize: 13,
+  fontSize: 12,
   color: "#6b7280",
   lineHeight: 1.45,
   minHeight: 18,
 };
 
 const shipmentBandStyle = {
-  marginTop: 14,
+  marginTop: 10,
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: "14px 16px",
+  padding: "10px 12px",
 };
 
 const shipmentTitleStyle = {
@@ -1083,15 +1132,15 @@ const shipmentTitleStyle = {
 const shipmentGridStyle = {
   display: "grid",
   gridTemplateColumns: "1fr 1fr 1fr",
-  gap: 14,
+  gap: 8,
 };
 
 const productsCardStyle = {
-  marginTop: 14,
+  marginTop: 10,
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: 16,
+  padding: 12,
 };
 
 const sectionTitleStyle = {
@@ -1124,7 +1173,7 @@ const miniTextareaStyle = {
   borderRadius: 10,
   border: "1px solid #d1d5db",
   boxSizing: "border-box",
-  fontSize: 13,
+  fontSize: 12,
   resize: "vertical",
   background: "#fff",
   color: "#111827",
@@ -1153,19 +1202,19 @@ const browseButtonStyle = {
 const tableStyle = {
   width: "100%",
   borderCollapse: "collapse",
-  minWidth: 1400,
+  minWidth: 900,
 };
 
 const productCellStyle = {
   display: "flex",
   alignItems: "center",
-  gap: 14,
-  minWidth: 220,
+  gap: 8,
+  minWidth: 150,
 };
 
 const thumbStyle = {
-  width: 38,
-  height: 38,
+  width: 30,
+  height: 30,
   borderRadius: 8,
   border: "1px solid #e5e7eb",
   background: "#f9fafb",
@@ -1187,27 +1236,27 @@ const productTitleStyle = {
 };
 
 const skuStyle = {
-  fontSize: 13,
+  fontSize: 12,
   color: "#6b7280",
   marginTop: 2,
 };
 
 const inlineInputStyle = {
-  width: 140,
-  height: 36,
+  width: 78,
+  height: 32,
   padding: "0 10px",
   borderRadius: 8,
   border: "1px solid #d1d5db",
-  fontSize: 13,
+  fontSize: 12,
 };
 
 const inlineNumberStyle = {
-  width: 90,
-  height: 36,
+  width: 54,
+  height: 32,
   padding: "0 10px",
   borderRadius: 8,
   border: "1px solid #d1d5db",
-  fontSize: 13,
+  fontSize: 12,
   textAlign: "right",
 };
 
@@ -1228,15 +1277,15 @@ const deleteButtonStyle = {
 const bottomGridStyle = {
   display: "grid",
   gridTemplateColumns: "1.2fr 0.8fr",
-  gap: 14,
-  marginTop: 14,
+  gap: 8,
+  marginTop: 10,
 };
 
 const cardStyle = {
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: 16,
+  padding: 12,
 };
 
 const smallLabelStyle = {
@@ -1253,7 +1302,7 @@ const infoValueStyle = {
 };
 
 const footerRowStyle = {
-  marginTop: 14,
+  marginTop: 10,
   display: "flex",
   justifyContent: "flex-end",
 };

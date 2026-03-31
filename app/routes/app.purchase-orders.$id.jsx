@@ -11,12 +11,26 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
-import { getSingleStoreLocation } from "../lib/shopify-location.server";
 
+
+function normalizeLocationGid(...values) {
+  for (const value of values) {
+    const trimmed = String(value || "").trim();
+    if (trimmed && trimmed !== "pending-location") return trimmed;
+  }
+  return null;
+}
+
+function getDefaultLocationGid() {
+  return (
+    process.env.SHOPIFY_LOCATION_GID ||
+    process.env.DEFAULT_LOCATION_GID ||
+    ""
+  );
+}
 
 
 export async function loader({ request, params }) {
-  const storeLocation = await getSingleStoreLocation(request);
   const po = await prisma.purchaseOrder.findUnique({
     where: { id: params.id },
     include: {
@@ -33,13 +47,39 @@ export async function loader({ request, params }) {
     orderBy: { company: "asc" },
   });
 
-  return { po, suppliers, storeLocation };
+  return { po, suppliers, resolvedLocationGid: normalizeLocationGid(po.locationGid, getDefaultLocationGid()) };
 }
 
 export async function action({ request, params }) {
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const url = new URL(request.url);
+
+
+  if (intent === "delete-draft") {
+    const po = await prisma.purchaseOrder.findUnique({
+      where: { id: params.id },
+      select: { id: true, status: true },
+    });
+
+    if (!po) {
+      return { error: "PO not found." };
+    }
+
+    if (po.status !== "DRAFT") {
+      return { error: "Only draft POs can be deleted." };
+    }
+
+    await prisma.purchaseOrderLine.deleteMany({
+      where: { purchaseOrderId: params.id },
+    });
+
+    await prisma.purchaseOrder.delete({
+      where: { id: params.id },
+    });
+
+    return redirect(`/app/purchase-orders${url.search}`);
+  }
 
   if (intent === "create-supplier") {
     const company = String(formData.get("company") || "").trim();
@@ -206,17 +246,31 @@ export async function action({ request, params }) {
       ]),
     );
 
+    const resolvedLocationGid = normalizeLocationGid(
+      locationGid,
+      existing?.locationGid,
+      getDefaultLocationGid(),
+    );
+
     await prisma.purchaseOrder.update({
       where: { id: params.id },
       data: {
+        supplier: {
+          connect: { id: supplier.id },
+        },
+      },
+    });
+
+    await prisma.purchaseOrder.updateMany({
+      where: { id: params.id },
+      data: {
         poNumber,
-        supplierId: supplier.id,
         vendorName: supplier.company,
         vendorAddress: vendorAddress || null,
 
-        locationGid: storeLocation.id,
-        destinationName: destinationName || null,
-        destinationAddr: destinationAddr || null,
+        ...(resolvedLocationGid ? { locationGid: resolvedLocationGid } : {}),
+        destinationName: destinationName || existing?.destinationName || null,
+        destinationAddr: destinationAddr || existing?.destinationAddr || null,
 
         estimatedArrival: estimatedArrival || null,
         shippingCarrier: shippingCarrier || null,
@@ -230,7 +284,7 @@ export async function action({ request, params }) {
         noteToSupplier: noteToSupplier || null,
         tags: tags || null,
 
-        status: intent === "mark-ordered" ? "ORDERED" : undefined,
+        ...(intent === "mark-ordered" ? { status: "ORDERED" } : {}),
       },
     });
 
@@ -255,7 +309,7 @@ export async function action({ request, params }) {
             currentInventory: Number(line.currentInventory || 0),
             currentCost: Number(line.currentCost || 0),
             qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
-            qtyReceiving: Number(line.qtyReceiving || 1),
+            qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1),
             qtyReceivedTotal: prevReceived,
             itemCost: Number(line.itemCost || 0),
           };
@@ -283,8 +337,15 @@ export async function action({ request, params }) {
       lines = [];
     }
 
-    const storeLocation = await getSingleStoreLocation(request);
-    const locationGid = storeLocation.id;
+    const locationGid = normalizeLocationGid(
+      formData.get("locationGid"),
+      po.locationGid,
+      getDefaultLocationGid(),
+    );
+
+    if (!locationGid) {
+      return { error: "This PO does not have a valid Shopify location yet. Save the PO with a valid location before receiving inventory." };
+    }
 
     const { admin } = await authenticate.admin(request);
 
@@ -316,7 +377,7 @@ export async function action({ request, params }) {
           variables: {
             input: {
               reason: "correction",
-              name: "on_hand",
+              name: "available",
               referenceDocumentUri: `po://${po.poNumber}`,
               changes: [
                 {
@@ -367,7 +428,7 @@ export async function action({ request, params }) {
       }
     }
 
-    await prisma.purchaseOrder.update({
+    await prisma.purchaseOrder.updateMany({
       where: { id: params.id },
       data: {
         status: intent === "complete-order"
@@ -377,60 +438,41 @@ export async function action({ request, params }) {
           : receiptLines.some((l) => Number(l.qtyReceivedTotalAfter) > 0)
           ? "PARTIALLY_RECEIVED"
           : po.status,
-        lines: {
-          deleteMany: {},
-          create: receiptLines.map((line) => ({
-            productTitle: line.productTitle || "",
-            sku: line.sku || "",
-            supplierSku: line.supplierSku || null,
-            inventoryItemGid: line.inventoryItemGid || null,
-            variantId: line.variantId || null,
-            imageUrl: line.imageUrl || null,
-            currentInventory: Number(line.currentInventory || 0),
-            currentCost: Number(line.currentCost || 0),
-            qtyOrdered: Number(line.qtyOrdered || 0),
-            qtyReceiving: Number(line.qtyReceiving || 0),
-            qtyReceivedTotal: Number(line.qtyReceivedTotalAfter || 0),
-            itemCost: Number(line.itemCost || 0),
-          })),
-        },
       },
     });
-
-    return redirect(`/app/purchase-orders/${params.id}${url.search}`);
-  }
-
-
-  if (intent === "delete-po") {
-    const poToDelete = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      select: { id: true, status: true },
-    });
-
-    if (!poToDelete) {
-      return { error: "PO not found." };
-    }
-
-    if (poToDelete.status !== "DRAFT") {
-      return { error: "Only draft POs can be deleted." };
-    }
 
     await prisma.purchaseOrderLine.deleteMany({
       where: { purchaseOrderId: params.id },
     });
 
-    await prisma.purchaseOrder.delete({
-      where: { id: params.id },
-    });
+    if (receiptLines.length) {
+      await prisma.purchaseOrderLine.createMany({
+        data: receiptLines.map((line) => ({
+          purchaseOrderId: params.id,
+          productTitle: line.productTitle || "",
+          sku: line.sku || "",
+          supplierSku: line.supplierSku || null,
+          inventoryItemGid: line.inventoryItemGid || null,
+          variantId: line.variantId || null,
+          imageUrl: line.imageUrl || null,
+          currentInventory: Number(line.currentInventory || 0),
+          currentCost: Number(line.currentCost || 0),
+          qtyOrdered: Number(line.qtyOrdered || 0),
+          qtyReceiving: Number(line.qtyRemainingAfter || 0),
+          qtyReceivedTotal: Number(line.qtyReceivedTotalAfter || 0),
+          itemCost: Number(line.itemCost || 0),
+        })),
+      });
+    }
 
-    return redirect(`/app/purchase-orders${url.search || ""}`);
+    return redirect(`/app/purchase-orders/${params.id}${url.search}`);
   }
 
   return null;
 }
 
 export default function PurchaseOrderDetailPage() {
-  const { po, suppliers, storeLocation } = useLoaderData();
+  const { po, suppliers, resolvedLocationGid } = useLoaderData();
   const actionData = useActionData();
   const location = useLocation();
   const navigation = useNavigation();
@@ -454,7 +496,7 @@ export default function PurchaseOrderDetailPage() {
       sku: line.sku,
       supplierSku: line.supplierSku || "",
       qtyOrdered: Number(line.qtyOrdered || 1),
-      qtyReceiving: Number(line.qtyReceiving || 1),
+      qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1),
       qtyReceivedTotal: Number(line.qtyReceivedTotal || 0),
       qtyReceivingNow: 0,
       itemCost: Number(line.itemCost || 0),
@@ -544,23 +586,41 @@ export default function PurchaseOrderDetailPage() {
 
   function updateLine(index, field, value) {
     setSelectedProducts((prev) =>
-      prev.map((item, i) =>
-        i === index
-          ? {
-              ...item,
-              [field]:
-                field === "qtyOrdered" ||
-                field === "qtyReceiving" ||
-                field === "qtyReceivedTotal" ||
-                field === "qtyReceivingNow" ||
-                field === "itemCost" ||
-                field === "currentInventory" ||
-                field === "currentCost"
-                  ? Number(value || 0)
-                  : value,
-            }
-          : item,
-      ),
+      prev.map((item, i) => {
+        if (i !== index) return item;
+
+        const numericValue =
+          field === "qtyOrdered" ||
+          field === "qtyReceiving" ||
+          field === "qtyReceivedTotal" ||
+          field === "qtyReceivingNow" ||
+          field === "itemCost" ||
+          field === "currentInventory" ||
+          field === "currentCost"
+            ? Number(value || 0)
+            : value;
+
+        if (field === "qtyOrdered") {
+          return {
+            ...item,
+            qtyOrdered: Number(value || 0),
+            qtyReceiving: Number(value || 0),
+          };
+        }
+
+        if (field === "qtyReceiving" && po.status === "DRAFT") {
+          return {
+            ...item,
+            qtyReceiving: Number(value || 0),
+            qtyOrdered: Number(value || 0),
+          };
+        }
+
+        return {
+          ...item,
+          [field]: numericValue,
+        };
+      }),
     );
   }
 
@@ -578,7 +638,7 @@ export default function PurchaseOrderDetailPage() {
         <input type="hidden" name="supplierId" value={selectedSupplierId} />
         <input type="hidden" name="destinationName" value={po.destinationName || ""} />
         <input type="hidden" name="destinationAddr" value={po.destinationAddr || ""} />
-        <input type="hidden" name="locationGid" value={po.locationGid || "pending-location"} />
+        <input type="hidden" name="locationGid" value={resolvedLocationGid || ""} />
         <input type="hidden" name="linesJson" value={JSON.stringify(selectedProducts)} />
         <input type="hidden" name="shippingTotal" value={shippingTotal} />
         <input type="hidden" name="dutyTotal" value={dutyTotal} />
@@ -617,14 +677,15 @@ export default function PurchaseOrderDetailPage() {
                 >
                   Mark as Ordered
                 </button>
+
                 <button
                   type="submit"
                   name="intent"
-                  value="delete-po"
-                  style={deleteDraftButtonStyle}
+                  value="delete-draft"
+                  style={dangerButtonStyle}
                   disabled={navigation.state === "submitting"}
                   onClick={(e) => {
-                    if (!window.confirm("Delete this draft PO? This cannot be undone.")) {
+                    if (!window.confirm("Delete this draft PO?")) {
                       e.preventDefault();
                     }
                   }}
@@ -643,7 +704,7 @@ export default function PurchaseOrderDetailPage() {
                   style={saveButtonStyle}
                   disabled={navigation.state === "submitting"}
                 >
-                  Save Receipt
+                  Receive
                 </button>
 
                 <button
@@ -756,22 +817,22 @@ export default function PurchaseOrderDetailPage() {
             />
           </div>
 
-          <div style={{ marginTop: 18, overflowX: "auto" }}>
+          <div style={{ marginTop: 10, overflowX: "auto" }}>
             <table style={tableStyle}>
               <thead>
                 <tr>
                   <Th>Products</Th>
-                  <Th>Supplier SKU</Th>
-                  <Th num>Qty Ordered</Th>
-                  <Th num>Qty Received</Th>
-                  {receiptMode ? <Th num>Qty Receiving Now</Th> : null}
-                  <Th num>Qty Remaining</Th>
-                  <Th num>Item Cost</Th>
-                  <Th num>Current Inventory</Th>
-                  <Th num>Current Cost</Th>
-                  <Th num>New Landed Cost</Th>
-                  <Th num>New Weighted Cost</Th>
+                  <Th>Supp SKU</Th>
+                  <Th num>Qty Ord.</Th>
+                  <Th num>Qty Rec.</Th>
+                  {receiptMode ? <Th num>Rec. Now</Th> : null}
+                  <Th num>Remaining</Th>
+                  <Th num>PO Cost</Th>
                   <Th num>Total</Th>
+                  <Th sep num>Inv. On Hand</Th>
+                  <Th num>On-Ground Cost</Th>
+                  <Th num>Landed Cost</Th>
+                  <Th num>Avg. Cost</Th>
                   <Th></Th>
                 </tr>
               </thead>
@@ -844,11 +905,11 @@ export default function PurchaseOrderDetailPage() {
                         />
                       </Td>
 
-                      <Td num>{line.currentInventory}</Td>
+                      <Td num>{money(line.receiptTotal)}</Td>
+                      <Td sep num>{line.currentInventory}</Td>
                       <Td num>{money(line.currentCost)}</Td>
                       <Td num>{money(line.newLandedCost)}</Td>
                       <Td num><strong>{money(line.newWeightedCost)}</strong></Td>
-                      <Td num>{money(line.receiptTotal)}</Td>
 
                       <Td>
                         <button
@@ -1046,7 +1107,7 @@ export default function PurchaseOrderDetailPage() {
                           </div>
                         </div>
 
-                        <div style={{ width: 90, textAlign: "right" }}>
+                        <div style={{ width: 54, textAlign: "right" }}>
                           <div style={smallLabelStyle}>Available</div>
                           <div style={infoValueStyle}>{item.currentInventory}</div>
                         </div>
@@ -1098,44 +1159,57 @@ function computeReceiptLines(poLike) {
     Number(poLike.otherFeesTotal || 0) +
     Number(poLike.taxTotal || 0);
 
-  const subtotal = (poLike.lines || []).reduce((sum, line) => {
-    const qty = Number(line.qtyReceivingNow || 0) > 0
-      ? Number(line.qtyReceivingNow || 0)
-      : Number(line.qtyReceiving || line.qtyOrdered || 0);
-    return sum + qty * Number(line.itemCost || 0);
-  }, 0);
-
-  return (poLike.lines || []).map((line) => {
+  const normalizedLines = (poLike.lines || []).map((line) => {
     const qtyOrdered = Number(line.qtyOrdered || 0);
     const qtyReceivedTotal = Number(line.qtyReceivedTotal || 0);
-    const qtyReceivingNow = Number(line.qtyReceivingNow || 0);
+    const qtyReceiving = Number(line.qtyReceiving || qtyOrdered || 0);
+    const qtyReceivingNow = Math.max(0, Number(line.qtyReceivingNow || 0));
     const qtyRemaining = Math.max(0, qtyOrdered - qtyReceivedTotal);
 
-    const receiptQty = qtyReceivingNow > 0 ? qtyReceivingNow : Number(line.qtyReceiving || line.qtyOrdered || 0);
-    const itemCost = Number(line.itemCost || 0);
-    const currentInventory = Number(line.currentInventory || 0);
-    const currentCost = Number(line.currentCost || 0);
-
-    const receiptTotal = receiptQty * itemCost;
-    const allocatedExtra = subtotal > 0 ? (receiptTotal / subtotal) * extraCharges : 0;
-    const newLandedCost = receiptQty > 0 ? (receiptTotal + allocatedExtra) / receiptQty : 0;
-    const newWeightedCost =
-      currentInventory + receiptQty > 0
-        ? ((currentInventory * currentCost) + (receiptQty * newLandedCost)) /
-          (currentInventory + receiptQty)
-        : 0;
-
-    const qtyReceivedTotalAfter = qtyReceivedTotal + qtyReceivingNow;
-    const qtyRemainingAfter = Math.max(0, qtyOrdered - qtyReceivedTotalAfter);
+    const displayQty =
+      qtyReceivingNow > 0
+        ? qtyReceivingNow
+        : qtyRemaining > 0
+        ? qtyRemaining
+        : qtyReceiving;
 
     return {
       ...line,
       qtyOrdered,
       qtyReceivedTotal,
+      qtyReceiving,
       qtyReceivingNow,
       qtyRemaining,
+      displayQty,
+    };
+  });
+
+  const subtotal = normalizedLines.reduce((sum, line) => {
+    return sum + line.displayQty * Number(line.itemCost || 0);
+  }, 0);
+
+  return normalizedLines.map((line) => {
+    const itemCost = Number(line.itemCost || 0);
+    const currentInventory = Number(line.currentInventory || 0);
+    const currentCost = Number(line.currentCost || 0);
+
+    const receiptQty = line.qtyReceivingNow;
+    const displayTotal = line.displayQty * itemCost;
+    const allocatedExtra = subtotal > 0 ? (displayTotal / subtotal) * extraCharges : 0;
+    const newLandedCost = line.displayQty > 0 ? (displayTotal + allocatedExtra) / line.displayQty : 0;
+    const newWeightedCost =
+      currentInventory + line.displayQty > 0
+        ? ((currentInventory * currentCost) + (line.displayQty * newLandedCost)) /
+          (currentInventory + line.displayQty)
+        : 0;
+
+    const qtyReceivedTotalAfter = line.qtyReceivedTotal + receiptQty;
+    const qtyRemainingAfter = Math.max(0, line.qtyOrdered - qtyReceivedTotalAfter);
+
+    return {
+      ...line,
       receiptQty,
-      receiptTotal,
+      receiptTotal: displayTotal,
       newLandedCost,
       newWeightedCost,
       qtyReceivedTotalAfter,
@@ -1144,16 +1218,17 @@ function computeReceiptLines(poLike) {
   });
 }
 
-function Th({ children, num = false }) {
+function Th({ children, num = false, sep = false }) {
   return (
     <th
       style={{
         textAlign: num ? "right" : "left",
-        padding: "12px 10px",
+        borderLeft: sep ? "2px solid #e5e7eb" : "none",
+        padding: "9px 6px",
         borderBottom: "1px solid #e5e7eb",
-        fontSize: 13,
+        fontSize: 12,
         color: "#374151",
-        whiteSpace: "nowrap",
+        whiteSpace: "normal",
       }}
     >
       {children}
@@ -1161,15 +1236,16 @@ function Th({ children, num = false }) {
   );
 }
 
-function Td({ children, num = false }) {
+function Td({ children, num = false, sep = false }) {
   return (
     <td
       style={{
         textAlign: num ? "right" : "left",
-        padding: "14px 10px",
+        borderLeft: sep ? "2px solid #f0f0f0" : "none",
+        padding: "8px 6px",
         borderBottom: "1px solid #f0f0f0",
         verticalAlign: "middle",
-        whiteSpace: "nowrap",
+        whiteSpace: "normal",
       }}
     >
       {children}
@@ -1203,7 +1279,7 @@ const pageTitleStyle = {
 const statusStyle = {
   marginTop: 6,
   color: "#2563eb",
-  fontSize: 13,
+  fontSize: 12,
   fontWeight: 700,
 };
 
@@ -1217,16 +1293,16 @@ const topWrapStyle = {
 };
 
 const topPanelStyleLeft = {
-  padding: "16px 18px 12px 18px",
+  padding: "12px 14px 10px 14px",
   borderRight: "1px solid #e5e7eb",
 };
 
 const topPanelStyleRight = {
-  padding: "16px 18px 12px 18px",
+  padding: "12px 14px 10px 14px",
 };
 
 const panelLabelStyle = {
-  fontSize: 13,
+  fontSize: 12,
   fontWeight: 700,
   marginBottom: 8,
   color: "#374151",
@@ -1261,18 +1337,18 @@ const destinationTitleStyle = {
 };
 
 const subTextStyle = {
-  fontSize: 13,
+  fontSize: 12,
   color: "#6b7280",
   lineHeight: 1.45,
   minHeight: 18,
 };
 
 const shipmentBandStyle = {
-  marginTop: 14,
+  marginTop: 10,
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: "14px 16px",
+  padding: "10px 12px",
 };
 
 const shipmentTitleStyle = {
@@ -1285,15 +1361,15 @@ const shipmentTitleStyle = {
 const shipmentGridStyle = {
   display: "grid",
   gridTemplateColumns: "1fr 1fr 1fr",
-  gap: 14,
+  gap: 8,
 };
 
 const productsCardStyle = {
-  marginTop: 14,
+  marginTop: 10,
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: 16,
+  padding: 12,
 };
 
 const sectionTitleStyle = {
@@ -1326,7 +1402,7 @@ const miniTextareaStyle = {
   borderRadius: 10,
   border: "1px solid #d1d5db",
   boxSizing: "border-box",
-  fontSize: 13,
+  fontSize: 12,
   resize: "vertical",
   background: "#fff",
   color: "#111827",
@@ -1345,19 +1421,19 @@ const searchInputStyle = {
 const tableStyle = {
   width: "100%",
   borderCollapse: "collapse",
-  minWidth: 1600,
+  minWidth: 980,
 };
 
 const productCellStyle = {
   display: "flex",
   alignItems: "center",
-  gap: 14,
-  minWidth: 220,
+  gap: 8,
+  minWidth: 150,
 };
 
 const thumbStyle = {
-  width: 38,
-  height: 38,
+  width: 30,
+  height: 30,
   borderRadius: 8,
   border: "1px solid #e5e7eb",
   background: "#f9fafb",
@@ -1379,27 +1455,27 @@ const productTitleStyle = {
 };
 
 const skuStyle = {
-  fontSize: 13,
+  fontSize: 12,
   color: "#6b7280",
   marginTop: 2,
 };
 
 const inlineInputStyle = {
-  width: 140,
-  height: 36,
+  width: 78,
+  height: 32,
   padding: "0 10px",
   borderRadius: 8,
   border: "1px solid #d1d5db",
-  fontSize: 13,
+  fontSize: 12,
 };
 
 const inlineNumberStyle = {
-  width: 90,
-  height: 36,
+  width: 54,
+  height: 32,
   padding: "0 10px",
   borderRadius: 8,
   border: "1px solid #d1d5db",
-  fontSize: 13,
+  fontSize: 12,
   textAlign: "right",
 };
 
@@ -1420,15 +1496,15 @@ const deleteButtonStyle = {
 const bottomGridStyle = {
   display: "grid",
   gridTemplateColumns: "1.2fr 0.8fr",
-  gap: 14,
-  marginTop: 14,
+  gap: 8,
+  marginTop: 10,
 };
 
 const cardStyle = {
   background: "#fff",
   border: "1px solid #d9d9d9",
   borderRadius: 14,
-  padding: 16,
+  padding: 12,
 };
 
 const smallLabelStyle = {
@@ -1445,7 +1521,7 @@ const infoValueStyle = {
 };
 
 const footerRowStyle = {
-  marginTop: 14,
+  marginTop: 10,
   display: "flex",
   justifyContent: "flex-end",
 };
@@ -1470,7 +1546,7 @@ const secondaryButtonStyle = {
   cursor: "pointer",
 };
 
-const deleteDraftButtonStyle = {
+const dangerButtonStyle = {
   padding: "10px 16px",
   borderRadius: 9,
   border: "1px solid #b91c1c",
