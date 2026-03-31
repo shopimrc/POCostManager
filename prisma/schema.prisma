@@ -1,0 +1,109 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.sqlite"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model Supplier {
+  id             String   @id @default(cuid())
+  company        String
+  country        String?  @default("United States")
+  address1       String?
+  address2       String?
+  city           String?
+  state          String?
+  zip            String?
+  contactName    String?
+  email          String?
+  phone          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  purchaseOrders PurchaseOrder[]
+}
+
+model PurchaseOrder {
+  id                String   @id @default(cuid())
+  poNumber          String	 @unique
+  vendorName        String
+  vendorAddress     String?
+  locationGid       String
+  destinationName   String?
+  destinationAddr   String?
+  paymentTerms      String?
+  currency          String   @default("USD")
+  estimatedArrival  String?
+  shippingCarrier   String?
+  trackingNumber    String?
+  referenceNumber   String?
+  noteToSupplier    String?
+  tags              String?
+  status            String   @default("DRAFT")
+
+  shippingTotal     Float    @default(0)
+  dutyTotal         Float    @default(0)
+  otherFeesTotal    Float    @default(0)
+  taxTotal          Float    @default(0)
+
+  supplierId        String?
+  supplier          Supplier? @relation(fields: [supplierId], references: [id])
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  lines             PurchaseOrderLine[]
+}
+
+model PurchaseOrderLine {
+  id                    String        @id @default(cuid())
+  purchaseOrderId       String
+  purchaseOrder         PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  productTitle          String
+  sku                   String
+  supplierSku           String?
+
+  inventoryItemGid      String?
+  variantId             String?
+  imageUrl              String?
+
+  currentInventory      Int           @default(0)
+  currentCost           Float         @default(0)
+
+  qtyOrdered            Int           @default(0)
+  qtyReceiving          Int           @default(0)
+  qtyReceivedTotal		Int			  @default(0)
+
+  itemCost              Float         @default(0)
+  taxPercent            Float         @default(0)
+
+  allocatedLandedCost   Float         @default(0)
+  landedUnitCost        Float         @default(0)
+  projectedWeightedCost Float         @default(0)
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+}
