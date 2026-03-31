@@ -229,14 +229,14 @@ export async function action({ request }) {
     const response = await admin.graphql(
       `
       query SearchProducts($query: String!) {
-        products(first: 25, query: $query) {
+        products(first: 80, query: $query) {
           nodes {
             id
             title
             featuredImage {
               url
             }
-            variants(first: 25) {
+            variants(first: 10) {
               nodes {
                 id
                 title
