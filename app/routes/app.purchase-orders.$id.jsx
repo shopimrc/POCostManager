@@ -10,6 +10,7 @@ import {
 } from "react-router";
 import { useEffect, useMemo, useState } from "react";
 import prisma from "../db.server";
+import { ensurePoMetaobjectDefinitions, listPoRecords, getPoRecord, savePoRecord, deletePoRecord } from "../lib/shopify-po-storage.server.js";
 import { authenticate } from "../shopify.server";
 
 
@@ -31,7 +32,12 @@ function getDefaultLocationGid() {
 
 
 export async function loader({ request, params }) {
-  const po = await prisma.purchaseOrder.findUnique({
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
+  const storedPo = shopifyStorage ? await getPoRecord(admin, "purchaseOrder", params.id) : null;
+  const storedSupplier = storedPo?.supplierId ? await getPoRecord(admin, "supplier", storedPo.supplierId) : null;
+  const po = shopifyStorage ? (storedPo ? { ...storedPo, supplier: storedSupplier, lines: storedPo.lines || [] } : null) : await prisma.purchaseOrder.findUnique({
     where: { id: params.id },
     include: {
       supplier: true,
@@ -43,24 +49,26 @@ export async function loader({ request, params }) {
     throw new Response("PO not found", { status: 404 });
   }
 
-  const suppliers = await prisma.supplier.findMany({
-    orderBy: { company: "asc" },
-  });
+  const suppliers = shopifyStorage
+    ? (await listPoRecords(admin, "supplier")).sort((a, b) => a.company.localeCompare(b.company))
+    : await prisma.supplier.findMany({ orderBy: { company: "asc" } });
 
   return { po, suppliers, resolvedLocationGid: normalizeLocationGid(po.locationGid, getDefaultLocationGid()) };
 }
 
 export async function action({ request, params }) {
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const url = new URL(request.url);
 
 
   if (intent === "delete-draft") {
-    const po = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      select: { id: true, status: true },
-    });
+    const po = shopifyStorage
+      ? await getPoRecord(admin, "purchaseOrder", params.id)
+      : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, select: { id: true, status: true } });
 
     if (!po) {
       return { error: "PO not found." };
@@ -70,13 +78,12 @@ export async function action({ request, params }) {
       return { error: "Only draft POs can be deleted." };
     }
 
-    await prisma.purchaseOrderLine.deleteMany({
-      where: { purchaseOrderId: params.id },
-    });
-
-    await prisma.purchaseOrder.delete({
-      where: { id: params.id },
-    });
+    if (shopifyStorage) {
+      await deletePoRecord(admin, po);
+    } else {
+      await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
+      await prisma.purchaseOrder.delete({ where: { id: params.id } });
+    }
 
     return redirect(`/app/purchase-orders${url.search}`);
   }
@@ -97,8 +104,7 @@ export async function action({ request, params }) {
       return { error: "Supplier company name is required." };
     }
 
-    const supplier = await prisma.supplier.create({
-      data: {
+    const supplierData = {
         company,
         country: country || "United States",
         address1: address1 || null,
@@ -109,8 +115,10 @@ export async function action({ request, params }) {
         contactName: contactName || null,
         email: email || null,
         phone: phone || null,
-      },
-    });
+    };
+    const supplier = shopifyStorage
+      ? await savePoRecord(admin, "supplier", { id: crypto.randomUUID(), ...supplierData, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+      : await prisma.supplier.create({ data: supplierData });
 
     return redirect(`/app/purchase-orders/${params.id}${url.search}&supplierId=${supplier.id}`);
   }
@@ -207,20 +215,17 @@ export async function action({ request, params }) {
       return { error: "PO Number and Supplier are required." };
     }
 
-    const existingPo = await prisma.purchaseOrder.findFirst({
-      where: {
-        poNumber,
-        NOT: { id: params.id },
-      },
-    });
+    const existingPo = shopifyStorage
+      ? (await listPoRecords(admin, "purchaseOrder")).find((po) => po.poNumber === poNumber && po.id !== params.id)
+      : await prisma.purchaseOrder.findFirst({ where: { poNumber, NOT: { id: params.id } } });
 
     if (existingPo) {
       return { error: `PO Number ${poNumber} already exists.` };
     }
 
-    const supplier = await prisma.supplier.findUnique({
-      where: { id: supplierId },
-    });
+    const supplier = shopifyStorage
+      ? await getPoRecord(admin, "supplier", supplierId)
+      : await prisma.supplier.findUnique({ where: { id: supplierId } });
 
     if (!supplier) {
       return { error: "Selected supplier was not found." };
@@ -234,10 +239,9 @@ export async function action({ request, params }) {
       .filter(Boolean)
       .join("\n");
 
-    const existing = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      include: { lines: true },
-    });
+    const existing = shopifyStorage
+      ? await getPoRecord(admin, "purchaseOrder", params.id)
+      : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, include: { lines: true } });
 
     const receivedByVariant = new Map(
       (existing?.lines || []).map((line) => [
@@ -252,18 +256,7 @@ export async function action({ request, params }) {
       getDefaultLocationGid(),
     );
 
-    await prisma.purchaseOrder.update({
-      where: { id: params.id },
-      data: {
-        supplier: {
-          connect: { id: supplier.id },
-        },
-      },
-    });
-
-    await prisma.purchaseOrder.updateMany({
-      where: { id: params.id },
-      data: {
+    const updateData = {
         poNumber,
         vendorName: supplier.company,
         vendorAddress: vendorAddress || null,
@@ -285,36 +278,28 @@ export async function action({ request, params }) {
         tags: tags || null,
 
         ...(intent === "mark-ordered" ? { status: "ORDERED" } : {}),
-      },
+    };
+    const updatedLines = lines.map((line) => {
+      const key = line.variantId || `${line.sku}-${line.productTitle}`;
+      const prevReceived = receivedByVariant.get(key) || 0;
+      return {
+        purchaseOrderId: params.id,
+        productTitle: line.productTitle || "", sku: line.sku || "", supplierSku: line.supplierSku || null,
+        inventoryItemGid: line.inventoryItemGid || null, variantId: line.variantId || null,
+        imageUrl: line.imageUrl || null, currentInventory: Number(line.currentInventory || 0),
+        currentCost: Number(line.currentCost || 0), qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
+        qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1), qtyReceivedTotal: prevReceived,
+        itemCost: Number(line.itemCost || 0),
+      };
     });
-
-    await prisma.purchaseOrderLine.deleteMany({
-      where: { purchaseOrderId: params.id },
-    });
-
-    if (lines.length) {
-      await prisma.purchaseOrderLine.createMany({
-        data: lines.map((line) => {
-          const key = line.variantId || `${line.sku}-${line.productTitle}`;
-          const prevReceived = receivedByVariant.get(key) || 0;
-
-          return {
-            purchaseOrderId: params.id,
-            productTitle: line.productTitle || "",
-            sku: line.sku || "",
-            supplierSku: line.supplierSku || null,
-            inventoryItemGid: line.inventoryItemGid || null,
-            variantId: line.variantId || null,
-            imageUrl: line.imageUrl || null,
-            currentInventory: Number(line.currentInventory || 0),
-            currentCost: Number(line.currentCost || 0),
-            qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
-            qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1),
-            qtyReceivedTotal: prevReceived,
-            itemCost: Number(line.itemCost || 0),
-          };
-        }),
-      });
+    if (shopifyStorage) {
+      if (!existing) return { error: "PO not found." };
+      await savePoRecord(admin, "purchaseOrder", { ...existing, ...updateData, supplierId: supplier.id, lines: updatedLines, updatedAt: new Date().toISOString() });
+    } else {
+      await prisma.purchaseOrder.update({ where: { id: params.id }, data: { supplier: { connect: { id: supplier.id } } } });
+      await prisma.purchaseOrder.updateMany({ where: { id: params.id }, data: updateData });
+      await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
+      if (updatedLines.length) await prisma.purchaseOrderLine.createMany({ data: updatedLines });
     }
 
     return redirect(`/app/purchase-orders/${params.id}${url.search}`);
