@@ -9,6 +9,7 @@ import {
 } from "react-router";
 import { useEffect, useMemo, useState } from "react";
 import prisma from "../db.server";
+import { ensurePoMetaobjectDefinitions, listPoRecords, getPoRecord, savePoRecord } from "../lib/shopify-po-storage.server.js";
 import { authenticate } from "../shopify.server";
 
 async function getShopifyLocations(request) {
@@ -151,16 +152,19 @@ function mergeLiveLineData(lines, snapshots) {
 }
 
 export async function loader({ request }) {
-  const suppliers = await prisma.supplier.findMany({
-    orderBy: { company: "asc" },
-  });
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
+  const suppliers = shopifyStorage
+    ? (await listPoRecords(admin, "supplier")).sort((a, b) => a.company.localeCompare(b.company))
+    : await prisma.supplier.findMany({ orderBy: { company: "asc" } });
 
   const locations = await getShopifyLocations(request);
   const defaultDestination = buildDestination(locations[0] || null);
 
-  const existingPoNumbers = await prisma.purchaseOrder.findMany({
-    select: { poNumber: true },
-  });
+  const existingPoNumbers = shopifyStorage
+    ? await listPoRecords(admin, "purchaseOrder")
+    : await prisma.purchaseOrder.findMany({ select: { poNumber: true } });
 
   let highestPoNumber = 0;
   for (const row of existingPoNumbers) {
@@ -181,6 +185,9 @@ export async function loader({ request }) {
 
 export async function action({ request }) {
   const formData = await request.formData();
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
   const url = new URL(request.url);
   const intent = String(formData.get("intent") || "");
 
@@ -200,8 +207,7 @@ export async function action({ request }) {
       return { error: "Supplier company name is required." };
     }
 
-    const supplier = await prisma.supplier.create({
-      data: {
+    const supplierData = {
         company,
         country: country || "United States",
         address1: address1 || null,
@@ -212,8 +218,10 @@ export async function action({ request }) {
         contactName: contactName || null,
         email: email || null,
         phone: phone || null,
-      },
-    });
+    };
+    const supplier = shopifyStorage
+      ? await savePoRecord(admin, "supplier", { id: crypto.randomUUID(), ...supplierData, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+      : await prisma.supplier.create({ data: supplierData });
 
     const next = new URLSearchParams(url.search);
     next.set("supplierId", supplier.id);
@@ -313,17 +321,17 @@ export async function action({ request }) {
     return { error: "PO Number and Supplier are required." };
   }
 
-  const existingPo = await prisma.purchaseOrder.findUnique({
-    where: { poNumber },
-  });
+  const existingPo = shopifyStorage
+    ? (await listPoRecords(admin, "purchaseOrder")).find((po) => po.poNumber === poNumber)
+    : await prisma.purchaseOrder.findUnique({ where: { poNumber } });
 
   if (existingPo) {
     return { error: `PO Number ${poNumber} already exists.` };
   }
 
-  const supplier = await prisma.supplier.findUnique({
-    where: { id: supplierId },
-  });
+  const supplier = shopifyStorage
+    ? await getPoRecord(admin, "supplier", supplierId)
+    : await prisma.supplier.findUnique({ where: { id: supplierId } });
 
   if (!supplier) {
     return { error: "Selected supplier was not found." };
@@ -347,8 +355,7 @@ export async function action({ request }) {
     .filter(Boolean)
     .join("\n");
 
-  const po = await prisma.purchaseOrder.create({
-    data: {
+  const poData = {
       poNumber,
       supplierId: supplier.id,
       vendorName: supplier.company,
@@ -373,8 +380,7 @@ export async function action({ request }) {
       referenceNumber: "IMRC Racing N Repair",
       status: "DRAFT",
 
-      lines: {
-        create: lines.map((line) => ({
+      lines: lines.map((line) => ({
           productTitle: line.productTitle || "",
           sku: line.sku || "",
           supplierSku: line.supplierSku || null,
@@ -387,9 +393,10 @@ export async function action({ request }) {
           qtyReceiving: Number(line.qtyOrdered || line.qtyReceiving || 1),
           itemCost: Number(line.itemCost || 0),
         })),
-      },
-    },
-  });
+  };
+  const po = shopifyStorage
+    ? await savePoRecord(admin, "purchaseOrder", { id: crypto.randomUUID(), ...poData, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+    : await prisma.purchaseOrder.create({ data: { ...poData, lines: { create: poData.lines } } });
 
   return redirect(`/app/purchase-orders/${po.id}${url.search}`);
 }

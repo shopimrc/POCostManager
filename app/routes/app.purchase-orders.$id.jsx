@@ -10,6 +10,7 @@ import {
 } from "react-router";
 import { useEffect, useMemo, useState } from "react";
 import prisma from "../db.server";
+import { ensurePoMetaobjectDefinitions, listPoRecords, getPoRecord, savePoRecord, deletePoRecord } from "../lib/shopify-po-storage.server.js";
 import { authenticate } from "../shopify.server";
 
 
@@ -31,7 +32,12 @@ function getDefaultLocationGid() {
 
 
 export async function loader({ request, params }) {
-  const po = await prisma.purchaseOrder.findUnique({
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
+  const storedPo = shopifyStorage ? await getPoRecord(admin, "purchaseOrder", params.id) : null;
+  const storedSupplier = storedPo?.supplierId ? await getPoRecord(admin, "supplier", storedPo.supplierId) : null;
+  const po = shopifyStorage ? (storedPo ? { ...storedPo, supplier: storedSupplier, lines: storedPo.lines || [] } : null) : await prisma.purchaseOrder.findUnique({
     where: { id: params.id },
     include: {
       supplier: true,
@@ -43,24 +49,26 @@ export async function loader({ request, params }) {
     throw new Response("PO not found", { status: 404 });
   }
 
-  const suppliers = await prisma.supplier.findMany({
-    orderBy: { company: "asc" },
-  });
+  const suppliers = shopifyStorage
+    ? (await listPoRecords(admin, "supplier")).sort((a, b) => a.company.localeCompare(b.company))
+    : await prisma.supplier.findMany({ orderBy: { company: "asc" } });
 
   return { po, suppliers, resolvedLocationGid: normalizeLocationGid(po.locationGid, getDefaultLocationGid()) };
 }
 
 export async function action({ request, params }) {
+  const shopifyStorage = process.env.IMRC_PO_STORAGE === "shopify";
+  const admin = shopifyStorage ? (await authenticate.admin(request)).admin : null;
+  if (shopifyStorage) await ensurePoMetaobjectDefinitions(admin);
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const url = new URL(request.url);
 
 
   if (intent === "delete-draft") {
-    const po = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      select: { id: true, status: true },
-    });
+    const po = shopifyStorage
+      ? await getPoRecord(admin, "purchaseOrder", params.id)
+      : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, select: { id: true, status: true } });
 
     if (!po) {
       return { error: "PO not found." };
@@ -70,13 +78,12 @@ export async function action({ request, params }) {
       return { error: "Only draft POs can be deleted." };
     }
 
-    await prisma.purchaseOrderLine.deleteMany({
-      where: { purchaseOrderId: params.id },
-    });
-
-    await prisma.purchaseOrder.delete({
-      where: { id: params.id },
-    });
+    if (shopifyStorage) {
+      await deletePoRecord(admin, po);
+    } else {
+      await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
+      await prisma.purchaseOrder.delete({ where: { id: params.id } });
+    }
 
     return redirect(`/app/purchase-orders${url.search}`);
   }
@@ -97,8 +104,7 @@ export async function action({ request, params }) {
       return { error: "Supplier company name is required." };
     }
 
-    const supplier = await prisma.supplier.create({
-      data: {
+    const supplierData = {
         company,
         country: country || "United States",
         address1: address1 || null,
@@ -109,8 +115,10 @@ export async function action({ request, params }) {
         contactName: contactName || null,
         email: email || null,
         phone: phone || null,
-      },
-    });
+    };
+    const supplier = shopifyStorage
+      ? await savePoRecord(admin, "supplier", { id: crypto.randomUUID(), ...supplierData, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+      : await prisma.supplier.create({ data: supplierData });
 
     return redirect(`/app/purchase-orders/${params.id}${url.search}&supplierId=${supplier.id}`);
   }
@@ -207,20 +215,17 @@ export async function action({ request, params }) {
       return { error: "PO Number and Supplier are required." };
     }
 
-    const existingPo = await prisma.purchaseOrder.findFirst({
-      where: {
-        poNumber,
-        NOT: { id: params.id },
-      },
-    });
+    const existingPo = shopifyStorage
+      ? (await listPoRecords(admin, "purchaseOrder")).find((po) => po.poNumber === poNumber && po.id !== params.id)
+      : await prisma.purchaseOrder.findFirst({ where: { poNumber, NOT: { id: params.id } } });
 
     if (existingPo) {
       return { error: `PO Number ${poNumber} already exists.` };
     }
 
-    const supplier = await prisma.supplier.findUnique({
-      where: { id: supplierId },
-    });
+    const supplier = shopifyStorage
+      ? await getPoRecord(admin, "supplier", supplierId)
+      : await prisma.supplier.findUnique({ where: { id: supplierId } });
 
     if (!supplier) {
       return { error: "Selected supplier was not found." };
@@ -234,10 +239,9 @@ export async function action({ request, params }) {
       .filter(Boolean)
       .join("\n");
 
-    const existing = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      include: { lines: true },
-    });
+    const existing = shopifyStorage
+      ? await getPoRecord(admin, "purchaseOrder", params.id)
+      : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, include: { lines: true } });
 
     const receivedByVariant = new Map(
       (existing?.lines || []).map((line) => [
@@ -252,18 +256,7 @@ export async function action({ request, params }) {
       getDefaultLocationGid(),
     );
 
-    await prisma.purchaseOrder.update({
-      where: { id: params.id },
-      data: {
-        supplier: {
-          connect: { id: supplier.id },
-        },
-      },
-    });
-
-    await prisma.purchaseOrder.updateMany({
-      where: { id: params.id },
-      data: {
+    const updateData = {
         poNumber,
         vendorName: supplier.company,
         vendorAddress: vendorAddress || null,
@@ -285,46 +278,45 @@ export async function action({ request, params }) {
         tags: tags || null,
 
         ...(intent === "mark-ordered" ? { status: "ORDERED" } : {}),
-      },
+    };
+    const updatedLines = lines.map((line) => {
+      const key = line.variantId || `${line.sku}-${line.productTitle}`;
+      const prevReceived = receivedByVariant.get(key) || 0;
+      return {
+        purchaseOrderId: params.id,
+        productTitle: line.productTitle || "", sku: line.sku || "", supplierSku: line.supplierSku || null,
+        inventoryItemGid: line.inventoryItemGid || null, variantId: line.variantId || null,
+        imageUrl: line.imageUrl || null, currentInventory: Number(line.currentInventory || 0),
+        currentCost: Number(line.currentCost || 0), qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
+        qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1), qtyReceivedTotal: prevReceived,
+        itemCost: Number(line.itemCost || 0),
+      };
     });
-
-    await prisma.purchaseOrderLine.deleteMany({
-      where: { purchaseOrderId: params.id },
-    });
-
-    if (lines.length) {
-      await prisma.purchaseOrderLine.createMany({
-        data: lines.map((line) => {
-          const key = line.variantId || `${line.sku}-${line.productTitle}`;
-          const prevReceived = receivedByVariant.get(key) || 0;
-
-          return {
-            purchaseOrderId: params.id,
-            productTitle: line.productTitle || "",
-            sku: line.sku || "",
-            supplierSku: line.supplierSku || null,
-            inventoryItemGid: line.inventoryItemGid || null,
-            variantId: line.variantId || null,
-            imageUrl: line.imageUrl || null,
-            currentInventory: Number(line.currentInventory || 0),
-            currentCost: Number(line.currentCost || 0),
-            qtyOrdered: Number(line.qtyOrdered || line.qtyReceiving || 1),
-            qtyReceiving: Number(line.qtyReceiving || line.qtyOrdered || 1),
-            qtyReceivedTotal: prevReceived,
-            itemCost: Number(line.itemCost || 0),
-          };
-        }),
-      });
+    if (shopifyStorage) {
+      if (!existing) return { error: "PO not found." };
+      await savePoRecord(admin, "purchaseOrder", { ...existing, ...updateData, supplierId: supplier.id, lines: updatedLines, updatedAt: new Date().toISOString() });
+    } else {
+      await prisma.purchaseOrder.update({ where: { id: params.id }, data: { supplier: { connect: { id: supplier.id } } } });
+      await prisma.purchaseOrder.updateMany({ where: { id: params.id }, data: updateData });
+      await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
+      if (updatedLines.length) await prisma.purchaseOrderLine.createMany({ data: updatedLines });
     }
 
     return redirect(`/app/purchase-orders/${params.id}${url.search}`);
   }
 
   if (intent === "receive-items" || intent === "complete-order") {
-    const po = await prisma.purchaseOrder.findUnique({
-      where: { id: params.id },
-      include: { lines: true },
-    });
+    // Shopify has no cross-mutation transaction for inventory adjustments and cost updates.
+    // Persist a one-way receipt marker before touching Shopify inventory. Any interrupted
+    // receipt is held for manual reconciliation rather than being applied twice.
+    const receiptId = crypto.randomUUID();
+    const currentPo = shopifyStorage ? await getPoRecord(admin, "purchaseOrder", params.id) : null;
+    if (shopifyStorage && currentPo?.receiptState?.status && currentPo.receiptState.status !== "completed") {
+      return { error: "A receipt has already started for this PO. Review Shopify inventory before continuing; automatic retries are blocked to prevent double receiving." };
+    }
+    const po = shopifyStorage
+      ? await getPoRecord(admin, "purchaseOrder", params.id)
+      : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, include: { lines: true } });
 
     if (!po) {
       return { error: "PO not found." };
@@ -349,6 +341,24 @@ export async function action({ request, params }) {
 
     const { admin } = await authenticate.admin(request);
 
+    if (po.status === "RECEIVED") return { error: "This purchase order has already been received." };
+    const submittedByKey = new Map(lines.map((line) => [line.variantId || `${line.sku}-${line.productTitle}`, line]));
+    for (const storedLine of po.lines || []) {
+      const key = storedLine.variantId || `${storedLine.sku}-${storedLine.productTitle}`;
+      const submitted = submittedByKey.get(key);
+      const receiving = Number(submitted?.qtyReceivingNow || 0);
+      const remaining = Math.max(0, Number(storedLine.qtyOrdered || 0) - Number(storedLine.qtyReceivedTotal || 0));
+      if (!Number.isInteger(receiving) || receiving < 0 || receiving > remaining) {
+        return { error: `Invalid receiving quantity for ${storedLine.sku || storedLine.productTitle}. Remaining: ${remaining}.` };
+      }
+      if (receiving > 0 && !storedLine.inventoryItemGid) {
+        return { error: `Missing Shopify inventory item for ${storedLine.sku || storedLine.productTitle}.` };
+      }
+    }
+    if (lines.some((line) => !((po.lines || []).some((stored) => (stored.variantId || `${stored.sku}-${stored.productTitle}`) === (line.variantId || `${line.sku}-${line.productTitle}`))))) {
+      return { error: "Receipt includes an item not on this purchase order." };
+    }
+
     const receiptLines = computeReceiptLines({
       lines,
       shippingTotal: Number(formData.get("shippingTotal") || po.shippingTotal || 0),
@@ -356,6 +366,18 @@ export async function action({ request, params }) {
       otherFeesTotal: Number(formData.get("otherFeesTotal") || po.otherFeesTotal || 0),
       taxTotal: Number(formData.get("taxTotal") || po.taxTotal || 0),
     });
+
+    if (shopifyStorage && currentPo?.receiptState?.status === "completed" && currentPo?.status === "RECEIVED") {
+      return { error: "This PO has already been fully received." };
+    }
+    if (shopifyStorage) {
+      // The marker is saved before the first inventory mutation; never clear it
+      // automatically after a network failure or an uncertain API response.
+      await savePoRecord(admin, "purchaseOrder", {
+        ...currentPo,
+        receiptState: { id: receiptId, status: "started", startedAt: new Date().toISOString() },
+      });
+    }
 
     for (const line of receiptLines) {
       const qtyReceivingNow = Number(line.qtyReceivingNow || 0);
@@ -428,41 +450,35 @@ export async function action({ request, params }) {
       }
     }
 
-    await prisma.purchaseOrder.updateMany({
-      where: { id: params.id },
-      data: {
-        status: intent === "complete-order"
+    if (shopifyStorage) {
+      await savePoRecord(admin, "purchaseOrder", {
+        ...currentPo,
+        receiptState: { id: receiptId, status: "inventory_applied", completedAt: new Date().toISOString() },
+      });
+    }
+
+    const nextStatus = intent === "complete-order"
           ? "RECEIVED"
           : receiptLines.every((l) => Number(l.qtyRemainingAfter) <= 0)
           ? "RECEIVED"
           : receiptLines.some((l) => Number(l.qtyReceivedTotalAfter) > 0)
           ? "PARTIALLY_RECEIVED"
-          : po.status,
-      },
-    });
-
-    await prisma.purchaseOrderLine.deleteMany({
-      where: { purchaseOrderId: params.id },
-    });
-
-    if (receiptLines.length) {
-      await prisma.purchaseOrderLine.createMany({
-        data: receiptLines.map((line) => ({
-          purchaseOrderId: params.id,
-          productTitle: line.productTitle || "",
-          sku: line.sku || "",
-          supplierSku: line.supplierSku || null,
-          inventoryItemGid: line.inventoryItemGid || null,
-          variantId: line.variantId || null,
-          imageUrl: line.imageUrl || null,
-          currentInventory: Number(line.currentInventory || 0),
-          currentCost: Number(line.currentCost || 0),
-          qtyOrdered: Number(line.qtyOrdered || 0),
-          qtyReceiving: Number(line.qtyRemainingAfter || 0),
-          qtyReceivedTotal: Number(line.qtyReceivedTotalAfter || 0),
-          itemCost: Number(line.itemCost || 0),
-        })),
-      });
+          : po.status;
+    const nextLines = receiptLines.map((line) => ({
+      purchaseOrderId: params.id,
+      productTitle: line.productTitle || "", sku: line.sku || "", supplierSku: line.supplierSku || null,
+      inventoryItemGid: line.inventoryItemGid || null, variantId: line.variantId || null,
+      imageUrl: line.imageUrl || null, currentInventory: Number(line.currentInventory || 0),
+      currentCost: Number(line.currentCost || 0), qtyOrdered: Number(line.qtyOrdered || 0),
+      qtyReceiving: Number(line.qtyRemainingAfter || 0), qtyReceivedTotal: Number(line.qtyReceivedTotalAfter || 0),
+      itemCost: Number(line.itemCost || 0),
+    }));
+    if (shopifyStorage) {
+      await savePoRecord(admin, "purchaseOrder", { ...po, status: nextStatus, lines: nextLines, receiptState: { id: receiptId, status: "completed", completedAt: new Date().toISOString() }, updatedAt: new Date().toISOString() });
+    } else {
+      await prisma.purchaseOrder.updateMany({ where: { id: params.id }, data: { status: nextStatus } });
+      await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
+      if (nextLines.length) await prisma.purchaseOrderLine.createMany({ data: nextLines });
     }
 
     return redirect(`/app/purchase-orders/${params.id}${url.search}`);
@@ -905,7 +921,7 @@ export default function PurchaseOrderDetailPage() {
                         />
                       </Td>
 
-                      <Td num>{money(line.receiptTotal)}</Td>
+                      <Td num>{money(Number(line.qtyOrdered || 0) * Number(line.itemCost || 0))}</Td>
                       <Td sep num>{line.currentInventory}</Td>
                       <Td num>{money(line.currentCost)}</Td>
                       <Td num>{money(line.newLandedCost)}</Td>
@@ -1185,7 +1201,7 @@ function computeReceiptLines(poLike) {
   });
 
   const subtotal = normalizedLines.reduce((sum, line) => {
-    return sum + line.displayQty * Number(line.itemCost || 0);
+    return sum + line.qtyReceivingNow * Number(line.itemCost || 0);
   }, 0);
 
   return normalizedLines.map((line) => {
@@ -1194,14 +1210,16 @@ function computeReceiptLines(poLike) {
     const currentCost = Number(line.currentCost || 0);
 
     const receiptQty = line.qtyReceivingNow;
-    const displayTotal = line.displayQty * itemCost;
+    // Only the quantity actually received belongs in the inventory cost average.
+    // The previous displayQty fallback could average unreceived units on partial receipts.
+    const displayTotal = receiptQty * itemCost;
     const allocatedExtra = subtotal > 0 ? (displayTotal / subtotal) * extraCharges : 0;
-    const newLandedCost = line.displayQty > 0 ? (displayTotal + allocatedExtra) / line.displayQty : 0;
+    const newLandedCost = receiptQty > 0 ? (displayTotal + allocatedExtra) / receiptQty : 0;
     const newWeightedCost =
-      currentInventory + line.displayQty > 0
-        ? ((currentInventory * currentCost) + (line.displayQty * newLandedCost)) /
-          (currentInventory + line.displayQty)
-        : 0;
+      currentInventory + receiptQty > 0
+        ? ((currentInventory * currentCost) + (receiptQty * newLandedCost)) /
+          (currentInventory + receiptQty)
+        : currentCost;
 
     const qtyReceivedTotalAfter = line.qtyReceivedTotal + receiptQty;
     const qtyRemainingAfter = Math.max(0, line.qtyOrdered - qtyReceivedTotalAfter);
@@ -1421,14 +1439,15 @@ const searchInputStyle = {
 const tableStyle = {
   width: "100%",
   borderCollapse: "collapse",
-  minWidth: 980,
+  minWidth: 1250,
+  tableLayout: "auto",
 };
 
 const productCellStyle = {
   display: "flex",
   alignItems: "center",
   gap: 8,
-  minWidth: 150,
+  minWidth: 210,
 };
 
 const thumbStyle = {
@@ -1470,7 +1489,8 @@ const inlineInputStyle = {
 };
 
 const inlineNumberStyle = {
-  width: 54,
+  width: 68,
+  boxSizing: "border-box",
   height: 32,
   padding: "0 10px",
   borderRadius: 8,
