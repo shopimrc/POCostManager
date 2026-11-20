@@ -72,7 +72,6 @@ export async function ensurePoMetaobjectDefinitions(admin) {
       definition: {
         type: definition.type,
         name: definition.name,
-        access: { admin: "MERCHANT_READ_WRITE" },
         fieldDefinitions: FIELDS,
       },
     });
