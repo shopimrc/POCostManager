@@ -1185,7 +1185,7 @@ function computeReceiptLines(poLike) {
   });
 
   const subtotal = normalizedLines.reduce((sum, line) => {
-    return sum + line.displayQty * Number(line.itemCost || 0);
+    return sum + line.qtyReceivingNow * Number(line.itemCost || 0);
   }, 0);
 
   return normalizedLines.map((line) => {
@@ -1194,14 +1194,16 @@ function computeReceiptLines(poLike) {
     const currentCost = Number(line.currentCost || 0);
 
     const receiptQty = line.qtyReceivingNow;
-    const displayTotal = line.displayQty * itemCost;
+    // Only the quantity actually received belongs in the inventory cost average.
+    // The previous displayQty fallback could average unreceived units on partial receipts.
+    const displayTotal = receiptQty * itemCost;
     const allocatedExtra = subtotal > 0 ? (displayTotal / subtotal) * extraCharges : 0;
-    const newLandedCost = line.displayQty > 0 ? (displayTotal + allocatedExtra) / line.displayQty : 0;
+    const newLandedCost = receiptQty > 0 ? (displayTotal + allocatedExtra) / receiptQty : 0;
     const newWeightedCost =
-      currentInventory + line.displayQty > 0
-        ? ((currentInventory * currentCost) + (line.displayQty * newLandedCost)) /
-          (currentInventory + line.displayQty)
-        : 0;
+      currentInventory + receiptQty > 0
+        ? ((currentInventory * currentCost) + (receiptQty * newLandedCost)) /
+          (currentInventory + receiptQty)
+        : currentCost;
 
     const qtyReceivedTotalAfter = line.qtyReceivedTotal + receiptQty;
     const qtyRemainingAfter = Math.max(0, line.qtyOrdered - qtyReceivedTotalAfter);
