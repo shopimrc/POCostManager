@@ -306,8 +306,14 @@ export async function action({ request, params }) {
   }
 
   if (intent === "receive-items" || intent === "complete-order") {
-    // Do not allow non-idempotent Shopify inventory adjustments until receipt journaling is implemented.
-    if (shopifyStorage) return { error: "Shopify-only receiving is temporarily disabled until safe receipt tracking is enabled." };
+    // Shopify has no cross-mutation transaction for inventory adjustments and cost updates.
+    // Persist a one-way receipt marker before touching Shopify inventory. Any interrupted
+    // receipt is held for manual reconciliation rather than being applied twice.
+    const receiptId = crypto.randomUUID();
+    const currentPo = shopifyStorage ? await getPoRecord(admin, "purchaseOrder", params.id) : null;
+    if (shopifyStorage && currentPo?.receiptState?.status) {
+      return { error: "A receipt has already started for this PO. Review Shopify inventory before continuing; automatic retries are blocked to prevent double receiving." };
+    }
     const po = shopifyStorage
       ? await getPoRecord(admin, "purchaseOrder", params.id)
       : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, include: { lines: true } });
@@ -360,6 +366,15 @@ export async function action({ request, params }) {
       otherFeesTotal: Number(formData.get("otherFeesTotal") || po.otherFeesTotal || 0),
       taxTotal: Number(formData.get("taxTotal") || po.taxTotal || 0),
     });
+
+    if (shopifyStorage) {
+      // The marker is saved before the first inventory mutation; never clear it
+      // automatically after a network failure or an uncertain API response.
+      await savePoRecord(admin, "purchaseOrder", {
+        ...currentPo,
+        receiptState: { id: receiptId, status: "started", startedAt: new Date().toISOString() },
+      });
+    }
 
     for (const line of receiptLines) {
       const qtyReceivingNow = Number(line.qtyReceivingNow || 0);
@@ -432,6 +447,13 @@ export async function action({ request, params }) {
       }
     }
 
+    if (shopifyStorage) {
+      await savePoRecord(admin, "purchaseOrder", {
+        ...currentPo,
+        receiptState: { id: receiptId, status: "inventory_applied", completedAt: new Date().toISOString() },
+      });
+    }
+
     const nextStatus = intent === "complete-order"
           ? "RECEIVED"
           : receiptLines.every((l) => Number(l.qtyRemainingAfter) <= 0)
@@ -449,7 +471,7 @@ export async function action({ request, params }) {
       itemCost: Number(line.itemCost || 0),
     }));
     if (shopifyStorage) {
-      await savePoRecord(admin, "purchaseOrder", { ...po, status: nextStatus, lines: nextLines, updatedAt: new Date().toISOString() });
+      await savePoRecord(admin, "purchaseOrder", { ...po, status: nextStatus, lines: nextLines, receiptState: { id: receiptId, status: "completed", completedAt: new Date().toISOString() }, updatedAt: new Date().toISOString() });
     } else {
       await prisma.purchaseOrder.updateMany({ where: { id: params.id }, data: { status: nextStatus } });
       await prisma.purchaseOrderLine.deleteMany({ where: { purchaseOrderId: params.id } });
