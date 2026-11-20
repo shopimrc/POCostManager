@@ -42,6 +42,7 @@ test("paginates Shopify PO records and preserves stable IDs", async () => {
 test("saves PO JSON without exposing a session token", async () => {
   const calls = [];
   const admin = fakeAdmin([
+    { data: { metaobjects: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } },
     { data: { metaobjectCreate: {
       metaobject: { id: "gid://shopify/Metaobject/3", handle: "three", fields: [
         { key: "record_id", value: "three" },
@@ -52,5 +53,24 @@ test("saves PO JSON without exposing a session token", async () => {
   ], calls);
   const saved = await savePoRecord(admin, "purchaseOrder", { id: "three", poNumber: "PO3" });
   assert.equal(saved.shopifyMetaobjectId, "gid://shopify/Metaobject/3");
-  assert.equal(calls[0].variables.metaobject.type, "imrc_purchase_order");
+  assert.equal(calls[1].variables.metaobject.type, "imrc_purchase_order");
+  assert.equal(calls[1].variables.metaobject.handle, "imrc-three");
+});
+
+
+test("updates existing PO instead of creating duplicate on retry", async () => {
+  const calls = [];
+  const admin = fakeAdmin([
+    { data: { metaobjects: { nodes: [{ id: "gid://shopify/Metaobject/3", fields: [
+      { key: "record_id", value: "three" },
+      { key: "payload", value: JSON.stringify({ id: "three", poNumber: "PO3" }) },
+    ] }], pageInfo: { hasNextPage: false, endCursor: null } } } },
+    { data: { metaobjectUpdate: { metaobject: { id: "gid://shopify/Metaobject/3", fields: [
+      { key: "record_id", value: "three" },
+      { key: "payload", value: JSON.stringify({ id: "three", poNumber: "PO3", status: "ORDERED" }) },
+    ] }, userErrors: [] } } },
+  ], calls);
+  const saved = await savePoRecord(admin, "purchaseOrder", { id: "three", poNumber: "PO3", status: "ORDERED" });
+  assert.equal(saved.status, "ORDERED");
+  assert.equal(calls[1].variables.id, "gid://shopify/Metaobject/3");
 });
