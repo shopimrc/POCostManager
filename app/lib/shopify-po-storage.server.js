@@ -110,17 +110,21 @@ export async function savePoRecord(admin, kind, record) {
   }
   const type = recordType(kind);
   const { shopifyMetaobjectId, ...payload } = record;
+  // A stable handle makes retries resolve to the same Shopify record.
+  // Check for existing records before creating to avoid duplicates after a retry.
+  const current = shopifyMetaobjectId ? null : await getPoRecord(admin, kind, payload.id);
+  const targetId = shopifyMetaobjectId || current?.shopifyMetaobjectId;
   const fields = [
     { key: "record_id", value: payload.id },
     { key: "payload", value: JSON.stringify(payload) },
   ];
-  if (shopifyMetaobjectId) {
+  if (targetId) {
     const data = await gql(admin, `mutation IMRCUpdate($id: ID!, $metaobject: MetaobjectUpdateInput!) {
       metaobjectUpdate(id: $id, metaobject: $metaobject) {
         metaobject { ${RECORD_FIELDS} }
         userErrors { field message code }
       }
-    }`, { id: shopifyMetaobjectId, metaobject: { fields } });
+    }`, { id: targetId, metaobject: { fields } });
     checkErrors(data.metaobjectUpdate.userErrors, "Update PO record");
     return parseRecord(data.metaobjectUpdate.metaobject);
   }
@@ -130,7 +134,7 @@ export async function savePoRecord(admin, kind, record) {
       userErrors { field message code }
     }
   }`, {
-    metaobject: { type, fields },
+    metaobject: { type, handle: `imrc-${payload.id.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`, fields },
   });
   checkErrors(data.metaobjectCreate.userErrors, "Create PO record");
   return parseRecord(data.metaobjectCreate.metaobject);
