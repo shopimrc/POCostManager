@@ -921,7 +921,7 @@ export default function PurchaseOrderDetailPage() {
                         />
                       </Td>
 
-                      <Td num>{money(line.receiptTotal)}</Td>
+                      <Td num>{money(Number(line.qtyOrdered || 0) * Number(line.itemCost || 0))}</Td>
                       <Td sep num>{line.currentInventory}</Td>
                       <Td num>{money(line.currentCost)}</Td>
                       <Td num>{money(line.newLandedCost)}</Td>
@@ -1439,14 +1439,15 @@ const searchInputStyle = {
 const tableStyle = {
   width: "100%",
   borderCollapse: "collapse",
-  minWidth: 980,
+  minWidth: 1250,
+  tableLayout: "auto",
 };
 
 const productCellStyle = {
   display: "flex",
   alignItems: "center",
   gap: 8,
-  minWidth: 150,
+  minWidth: 210,
 };
 
 const thumbStyle = {
@@ -1488,7 +1489,8 @@ const inlineInputStyle = {
 };
 
 const inlineNumberStyle = {
-  width: 54,
+  width: 68,
+  boxSizing: "border-box",
   height: 32,
   padding: "0 10px",
   borderRadius: 8,
