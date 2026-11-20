@@ -306,6 +306,8 @@ export async function action({ request, params }) {
   }
 
   if (intent === "receive-items" || intent === "complete-order") {
+    // Do not allow non-idempotent Shopify inventory adjustments until receipt journaling is implemented.
+    if (shopifyStorage) return { error: "Shopify-only receiving is temporarily disabled until safe receipt tracking is enabled." };
     const po = shopifyStorage
       ? await getPoRecord(admin, "purchaseOrder", params.id)
       : await prisma.purchaseOrder.findUnique({ where: { id: params.id }, include: { lines: true } });
