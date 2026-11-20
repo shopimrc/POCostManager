@@ -335,6 +335,24 @@ export async function action({ request, params }) {
 
     const { admin } = await authenticate.admin(request);
 
+    if (po.status === "RECEIVED") return { error: "This purchase order has already been received." };
+    const submittedByKey = new Map(lines.map((line) => [line.variantId || `${line.sku}-${line.productTitle}`, line]));
+    for (const storedLine of po.lines || []) {
+      const key = storedLine.variantId || `${storedLine.sku}-${storedLine.productTitle}`;
+      const submitted = submittedByKey.get(key);
+      const receiving = Number(submitted?.qtyReceivingNow || 0);
+      const remaining = Math.max(0, Number(storedLine.qtyOrdered || 0) - Number(storedLine.qtyReceivedTotal || 0));
+      if (!Number.isInteger(receiving) || receiving < 0 || receiving > remaining) {
+        return { error: `Invalid receiving quantity for ${storedLine.sku || storedLine.productTitle}. Remaining: ${remaining}.` };
+      }
+      if (receiving > 0 && !storedLine.inventoryItemGid) {
+        return { error: `Missing Shopify inventory item for ${storedLine.sku || storedLine.productTitle}.` };
+      }
+    }
+    if (lines.some((line) => !((po.lines || []).some((stored) => (stored.variantId || `${stored.sku}-${stored.productTitle}`) === (line.variantId || `${line.sku}-${line.productTitle}`))))) {
+      return { error: "Receipt includes an item not on this purchase order." };
+    }
+
     const receiptLines = computeReceiptLines({
       lines,
       shippingTotal: Number(formData.get("shippingTotal") || po.shippingTotal || 0),
