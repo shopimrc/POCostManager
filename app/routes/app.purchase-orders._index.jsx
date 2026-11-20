@@ -1,12 +1,23 @@
 import { Link, useLoaderData, useLocation } from "react-router";
 import prisma from "../db.server";
+import { authenticate } from "../shopify.server";
+import { listPoRecords } from "../lib/shopify-po-storage.server.js";
 
-export async function loader() {
-  const pos = await prisma.purchaseOrder.findMany({
-    include: { lines: true },
-    orderBy: { createdAt: "desc" },
-  });
+export async function loader({ request }) {
+  // Keep the live Prisma path until the migration and auth cutover are complete.
+  if (process.env.IMRC_PO_STORAGE !== "shopify") {
+    const pos = await prisma.purchaseOrder.findMany({
+      include: { lines: true },
+      orderBy: { createdAt: "desc" },
+    });
+    return { pos };
+  }
 
+  const { admin } = await authenticate.admin(request);
+  const records = await listPoRecords(admin, "purchaseOrder");
+  const pos = records
+    .map((po) => ({ ...po, lines: Array.isArray(po.lines) ? po.lines : [] }))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   return { pos };
 }
 
