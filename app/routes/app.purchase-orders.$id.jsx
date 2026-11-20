@@ -311,7 +311,7 @@ export async function action({ request, params }) {
     // receipt is held for manual reconciliation rather than being applied twice.
     const receiptId = crypto.randomUUID();
     const currentPo = shopifyStorage ? await getPoRecord(admin, "purchaseOrder", params.id) : null;
-    if (shopifyStorage && currentPo?.receiptState?.status) {
+    if (shopifyStorage && currentPo?.receiptState?.status && currentPo.receiptState.status !== "completed") {
       return { error: "A receipt has already started for this PO. Review Shopify inventory before continuing; automatic retries are blocked to prevent double receiving." };
     }
     const po = shopifyStorage
@@ -367,6 +367,9 @@ export async function action({ request, params }) {
       taxTotal: Number(formData.get("taxTotal") || po.taxTotal || 0),
     });
 
+    if (shopifyStorage && currentPo?.receiptState?.status === "completed" && currentPo?.status === "RECEIVED") {
+      return { error: "This PO has already been fully received." };
+    }
     if (shopifyStorage) {
       // The marker is saved before the first inventory mutation; never clear it
       // automatically after a network failure or an uncertain API response.
